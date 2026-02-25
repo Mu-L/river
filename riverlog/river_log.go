@@ -8,8 +8,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+
+	"github.com/tidwall/gjson"
 
 	"github.com/riverqueue/river/internal/jobexecutor"
 	"github.com/riverqueue/river/rivershared/baseservice"
@@ -17,9 +20,14 @@ import (
 )
 
 const (
-	maxSizeMB    = 2
-	maxSizeBytes = maxSizeMB * 1024 * 1024
-	metadataKey  = "river:log"
+	maxSizeMB      = 2
+	maxSizeBytes   = maxSizeMB * 1024 * 1024
+	maxTotalSizeMB = 8
+	maxTotalBytes  = maxTotalSizeMB * 1024 * 1024
+	// Hard ceiling to prevent pathological allocations from extreme configs.
+	maxTotalSizeMaxMB = 64
+	maxTotalBytesMax  = maxTotalSizeMaxMB * 1024 * 1024
+	metadataKey       = "river:log"
 )
 
 type contextKey struct{}
@@ -77,6 +85,16 @@ type MiddlewareConfig struct {
 	//
 	// Defaults to 2 MB (which is per job attempt).
 	MaxSizeBytes int
+
+	// MaxTotalBytes is the maximum total size of all persisted river logs for a
+	// job attempt history. If appending the latest attempt would exceed this
+	// size, oldest log entries are dropped first.
+	//
+	// The latest entry is always retained, even if doing so means the resulting
+	// payload exceeds MaxTotalBytes.
+	//
+	// Defaults to 8 MB. Values larger than 64 MB are clamped to 64 MB.
+	MaxTotalBytes int
 }
 
 // NewMiddleware initializes a new Middleware with the given slog handler
@@ -136,6 +154,7 @@ func defaultConfig(config *MiddlewareConfig) *MiddlewareConfig {
 	}
 
 	config.MaxSizeBytes = cmp.Or(config.MaxSizeBytes, maxSizeBytes)
+	config.MaxTotalBytes = min(cmp.Or(config.MaxTotalBytes, maxTotalBytes), maxTotalBytesMax)
 
 	return config
 }
@@ -150,10 +169,7 @@ type metadataWithLog struct {
 }
 
 func (m *Middleware) Work(ctx context.Context, job *rivertype.JobRow, doInner func(context.Context) error) error {
-	var (
-		existingLogData metadataWithLog
-		logBuf          bytes.Buffer
-	)
+	var logBuf bytes.Buffer
 
 	switch {
 	case m.newCustomContext != nil:
@@ -165,10 +181,6 @@ func (m *Middleware) Work(ctx context.Context, job *rivertype.JobRow, doInner fu
 		return errors.New("expected either newContextLogger or newSlogHandler to be set")
 	}
 
-	if err := json.Unmarshal(job.Metadata, &existingLogData); err != nil {
-		return err
-	}
-
 	metadataUpdates, hasMetadataUpdates := jobexecutor.MetadataUpdatesFromWorkContext(ctx)
 	if !hasMetadataUpdates {
 		return errors.New("expected to find metadata updates in context, but didn't")
@@ -176,30 +188,46 @@ func (m *Middleware) Work(ctx context.Context, job *rivertype.JobRow, doInner fu
 
 	// This all runs invariant of whether the job panics or returns an error.
 	defer func() {
-		logData := logBuf.String()
+		logBytes := logBuf.Bytes()
 
 		// Return early if nothing ended up getting logged.
-		if len(logData) < 1 {
+		if len(logBytes) < 1 {
 			return
 		}
 
 		// Postgres JSONB is limited to 255MB, but it would be a bad idea to get
 		// anywhere close to that limit here.
-		if len(logData) > m.config.MaxSizeBytes {
+		if len(logBytes) > m.config.MaxSizeBytes {
 			m.Logger.WarnContext(ctx, m.Name+": Logs size exceeded maximum; truncating",
-				slog.Int("logs_size", len(logData)),
+				slog.Int("logs_size", len(logBytes)),
 				slog.Int("max_size", m.config.MaxSizeBytes),
 			)
-			logData = logData[0:m.config.MaxSizeBytes]
+			logBytes = logBytes[0:m.config.MaxSizeBytes]
 		}
 
-		allLogDataBytes, err := json.Marshal(append(existingLogData.RiverLog, logAttempt{
+		newLogEntryBytes, err := json.Marshal(logAttempt{
 			Attempt: job.Attempt,
-			Log:     logData,
-		}))
+			Log:     string(logBytes),
+		})
 		if err != nil {
 			m.Logger.ErrorContext(ctx, m.Name+": Error marshaling log data",
 				slog.Any("error", err),
+			)
+			return
+		}
+
+		allLogDataBytes, numDroppedEntries, err := appendLogDataWithCap(job.Metadata, newLogEntryBytes, m.config.MaxTotalBytes)
+		if err != nil {
+			m.Logger.ErrorContext(ctx, m.Name+": Error marshaling log data",
+				slog.Any("error", err),
+			)
+			return
+		}
+
+		if numDroppedEntries > 0 {
+			m.Logger.WarnContext(ctx, m.Name+": Logs size exceeded total maximum; dropping oldest entries",
+				slog.Int("max_total_size", m.config.MaxTotalBytes),
+				slog.Int("num_entries_dropped", numDroppedEntries),
 			)
 		}
 
@@ -207,4 +235,126 @@ func (m *Middleware) Work(ctx context.Context, job *rivertype.JobRow, doInner fu
 	}()
 
 	return doInner(ctx)
+}
+
+func appendLogDataWithCap(metadataBytes, newLogEntryBytes []byte, maxTotalBytes int) ([]byte, int, error) {
+	existingLogData := gjson.GetBytes(metadataBytes, metadataKey)
+	var existingLogArrayBytes []byte
+	switch {
+	case !existingLogData.Exists():
+		existingLogArrayBytes = []byte("[]")
+	case existingLogData.IsArray():
+		// Slice raw JSON straight from metadata bytes to avoid an extra copy.
+		existingLogArrayBytes = metadataBytes[existingLogData.Index : existingLogData.Index+len(existingLogData.Raw)]
+	default:
+		return nil, 0, fmt.Errorf("%q value is not an array", metadataKey)
+	}
+
+	existingElementBounds, err := getArrayElementBounds(existingLogArrayBytes)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Determine the smallest suffix to keep that still fits with the new entry.
+	// This keeps pruning oldest-first while avoiding repeated full rewrites.
+	keepStart := getKeepStart(existingElementBounds, len(newLogEntryBytes), maxTotalBytes)
+
+	// Build the final array once from the kept suffix plus the new entry.
+	appendedLogDataBytes := buildAppendedArray(existingLogArrayBytes, existingElementBounds, keepStart, newLogEntryBytes)
+	numDroppedEntries := min(keepStart, len(existingElementBounds))
+
+	return appendedLogDataBytes, numDroppedEntries, nil
+}
+
+type arrayElementBounds struct {
+	Start int
+	End   int
+}
+
+func getArrayElementBounds(arrayBytes []byte) ([]arrayElementBounds, error) {
+	arrResult := gjson.ParseBytes(arrayBytes)
+	if !arrResult.IsArray() {
+		return nil, errors.New("expected a JSON array")
+	}
+
+	elements := arrResult.Array()
+	bounds := make([]arrayElementBounds, len(elements))
+	for i, elem := range elements {
+		if elem.Index < 0 {
+			return nil, errors.New("failed to determine array element index")
+		}
+		bounds[i] = arrayElementBounds{
+			Start: elem.Index,
+			End:   elem.Index + len(elem.Raw),
+		}
+	}
+	return bounds, nil
+}
+
+func getKeepStart(bounds []arrayElementBounds, newEntryLen, maxTotalBytes int) int {
+	if maxTotalBytes <= 0 {
+		return 0
+	}
+
+	// Keep newest entry even if it's larger than the configured cap.
+	newOnlyLen := 2 + newEntryLen // `[` + entry + `]`
+	if newOnlyLen > maxTotalBytes {
+		return len(bounds)
+	}
+
+	if len(bounds) == 0 {
+		return 0
+	}
+
+	lastEnd := bounds[len(bounds)-1].End
+
+	// Iterate from oldest to newest so we drop the minimum number of entries
+	// necessary to fit the configured cap.
+	for keepStart := 0; keepStart <= len(bounds); keepStart++ {
+		contentLen := newEntryLen
+		if keepStart < len(bounds) {
+			// Use actual byte offsets from parsed elements so separator
+			// whitespace is fully counted toward the cap.
+			keptContentLen := lastEnd - bounds[keepStart].Start
+			contentLen += 1 + keptContentLen // comma between kept suffix and new entry
+		}
+		totalLen := 2 + contentLen // `[` + content + `]`
+		if totalLen <= maxTotalBytes {
+			return keepStart
+		}
+	}
+
+	return len(bounds)
+}
+
+func buildAppendedArray(existingArrayBytes []byte, bounds []arrayElementBounds, keepStart int, newEntryBytes []byte) []byte {
+	totalLen := 0
+	maxInt := int(^uint(0) >> 1)
+
+	// Preallocation is an optimization only. If length math would overflow,
+	// fall back to zero-capacity and let append grow as needed.
+	if keepStart >= len(bounds) {
+		if len(newEntryBytes) <= maxInt-2 {
+			totalLen = 2 + len(newEntryBytes)
+		}
+	} else {
+		// Kept suffix is contiguous in the original array bytes, so copy once.
+		keptContentLen := bounds[len(bounds)-1].End - bounds[keepStart].Start
+		if keptContentLen >= 0 && len(newEntryBytes) <= maxInt-3 && keptContentLen <= maxInt-3-len(newEntryBytes) {
+			totalLen = 3 + keptContentLen + len(newEntryBytes) // [] + comma + new entry
+		}
+	}
+
+	result := make([]byte, 0, totalLen)
+	result = append(result, '[')
+
+	if keepStart < len(bounds) {
+		result = append(result, existingArrayBytes[bounds[keepStart].Start:bounds[len(bounds)-1].End]...)
+		result = append(result, ',')
+	}
+
+	result = append(result, newEntryBytes...)
+	result = append(result, ']')
+
+	return result
 }
